@@ -82,6 +82,10 @@ type (
 		clientInflight *semaphore.Weighted
 		debug          Logger
 		errors         Logger
+        cIncomingPackets chan *packets.ControlPacket
+		cOutgoingPackets chan *packets.ControlPacket
+		cPingresp chan *packets.Pingresp
+
 	}
 
 	// CommsProperties is a struct of the communication properties that may
@@ -132,6 +136,9 @@ func NewClient(conf ClientConfig) *Client {
 		ClientConfig: conf,
 		errors:       NOOPLogger{},
 		debug:        NOOPLogger{},
+        cIncomingPackets: make(chan *packets.ControlPacket),
+        cOutgoingPackets: make(chan *packets.ControlPacket),
+		cPingresp: make(chan *packets.Pingresp),
 	}
 
 	if c.Persistence == nil {
@@ -285,12 +292,20 @@ func (c *Client) Connect(ctx context.Context, cp *Connect) (*Connack, error) {
 	c.serverInflight = semaphore.NewWeighted(int64(c.serverProps.ReceiveMaximum))
 	c.clientInflight = semaphore.NewWeighted(int64(c.clientProps.ReceiveMaximum))
 
-	c.debug.Println("received CONNACK, starting PingHandler")
+	c.debug.Println("received CONNACK, starting workers")
+	c.startWorkers(keepalive)
+	return ca, nil
+}
+
+
+func (c *Client) startWorkers(keepalive uint16) {
+
+	c.debug.Println("starting PingHandler")
 	c.workers.Add(1)
 	go func() {
 		defer c.workers.Done()
 		defer c.debug.Println("returning from ping handler worker")
-		c.PingHandler.Start(c.Conn, time.Duration(keepalive)*time.Second)
+		c.PingHandler.Start(c.cPingresp, c.cOutgoingPackets, time.Duration(keepalive)*time.Second)
 	}()
 
 	c.debug.Println("starting publish packets loop")
@@ -299,6 +314,14 @@ func (c *Client) Connect(ctx context.Context, cp *Connect) (*Connack, error) {
 		defer c.workers.Done()
 		defer c.debug.Println("returning from publish packets loop worker")
 		c.routePublishPackets()
+	}()
+
+	c.debug.Println("starting incoming netloop")
+	c.workers.Add(1)
+	go func() {
+		defer c.workers.Done()
+		defer c.debug.Println("returning from incoming network loop")
+		c.incomingLoop()
 	}()
 
 	c.debug.Println("starting incoming")
@@ -337,8 +360,6 @@ func (c *Client) Connect(ctx context.Context, cp *Connect) (*Connack, error) {
 			}
 		}()
 	}
-
-	return ca, nil
 }
 
 func (c *Client) Ack(pb *Publish) error {
@@ -407,17 +428,13 @@ func (c *Client) routePublishPackets() {
 // Disconnect, the Stop channel is closed or there is an error reading
 // a packet from the network connection
 func (c *Client) incoming() {
+
 	defer c.debug.Println("client stopping, incoming stopping")
 	for {
 		select {
 		case <-c.stop:
-			return
-		default:
-			recv, err := packets.ReadPacket(c.Conn)
-			if err != nil {
-				go c.error(err)
-				return
-			}
+			return	
+        case recv := <- c.cIncomingPackets:
 			switch recv.Type {
 			case packets.CONNACK:
 				c.debug.Println("received CONNACK")
@@ -521,9 +538,46 @@ func (c *Client) incoming() {
 				}()
 				return
 			case packets.PINGRESP:
-				c.debug.Println("received PINGRESP")
-				c.PingHandler.PingResp()
+				go func() {
+					c.debug.Println("received PINGRESP")
+					c.cPingresp <- recv.Content.(*packets.Pingresp)
+				}()
 			}
+		}
+	}
+}
+
+func (c *Client) incomingLoop () {
+
+	cIncoming := make(chan *packets.ControlPacket)
+	readNext := func() {
+		recv, err := packets.ReadPacket(c.Conn)
+		if err != nil {
+			c.debug.Printf("incoming loop error: %v",err)
+			go c.error(err)
+			return
+		} else {
+			c.debug.Println(fmt.Sprintf("Received: %v", recv.PacketType()))
+			cIncoming <- recv
+		}
+	}
+
+	go readNext()
+    for {
+		select {
+		case <-c.stop:
+            c.debug.Println("Loop stop")
+			return
+		case p := <- c.cOutgoingPackets:
+			_, err := p.WriteTo(c.Conn)
+			if err != nil {
+				c.debug.Printf("outgoing loop error: %v",err)
+				go c.error(err)
+				return
+			}
+		case p:= <- cIncoming:
+			c.cIncomingPackets <- p
+			go readNext()
 		}
 	}
 }
@@ -636,7 +690,7 @@ func (c *Client) Subscribe(ctx context.Context, s *Subscribe) (*Suback, error) {
 	if !c.serverProps.SharedSubAvailable {
 		for _, sub := range s.Subscriptions {
 			if strings.HasPrefix(sub.Topic, "$share") {
-				return nil, fmt.Errorf("cannont subscribe to %s, server does not support shared subscriptions", sub.Topic)
+				return nil, fmt.Errorf("cannot subscribe to %s, server does not support shared subscriptions", sub.Topic)
 			}
 		}
 	}
