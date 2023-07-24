@@ -109,10 +109,16 @@ func (s *Subscribe) Buffers() net.Buffers {
 	return net.Buffers{b.Bytes(), propLen, idvp, subs.Bytes()}
 }
 
-// WriteTo is the implementation of the interface required function for a packet
-func (s *Subscribe) WriteTo(w io.Writer) (int64, error) {
+// Wrap the Subscribe object into a ControlPacket
+func (s *Subscribe) ToControlPacket() *ControlPacket {
 	cp := &ControlPacket{FixedHeader: FixedHeader{Type: SUBSCRIBE, Flags: 2}}
 	cp.Content = s
 
-	return cp.WriteTo(w)
+	return cp
 }
+
+// WriteTo is the implementation of the interface required function for a packet
+func (s *Subscribe) WriteTo(w io.Writer) (int64, error) {
+	return s.ToControlPacket().WriteTo(w)
+}
+
