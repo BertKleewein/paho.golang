@@ -18,7 +18,7 @@ func TestPingerPingHandlerTimeout(t *testing.T) {
 	debug := NOOPLogger{}
 	// debug := log.New(os.Stderr, "PINGTIMEOUT: ", log.LstdFlags)
 
-	go StartPinger(cPingresp, cOutgoingPackets, cStop, cError, keepalive, debug)
+	go DefaultPinger(cPingresp, cOutgoingPackets, cStop, cError, keepalive, debug)
 	defer close(cStop)
 	
 	select {
@@ -38,7 +38,7 @@ func TestPingerPingHandlerSuccess(t *testing.T) {
 	// debug = log.New(os.Stderr, "PINGSUCCESS: ", log.LstdFlags)
 
 
-	go StartPinger(cPingresp, cOutgoingPackets, cStop, cError, keepalive, debug)
+	go DefaultPinger(cPingresp, cOutgoingPackets, cStop, cError, keepalive, debug)
 	defer close(cStop)
 
 	select {

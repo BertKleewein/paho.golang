@@ -7,12 +7,20 @@ import (
 	"github.com/eclipse/paho.golang/packets"
 )
 
+type Pinger func(
+	receive <-chan *packets.Pingresp, 
+	send chan<- *packets.ControlPacket, 
+	stop <-chan struct{},
+	error chan<- error,
+	pt time.Duration,
+	debug Logger,
+);
 
-func StartPinger(
-	cPingresp chan *packets.Pingresp, 
-	cOutgoingPackets chan *packets.ControlPacket, 
-	cStop chan struct{},
-	cError chan error,
+func DefaultPinger(
+	receive <-chan *packets.Pingresp, 
+	send chan<- *packets.ControlPacket, 
+	stop <-chan struct{},
+	error chan<- error,
 	pt time.Duration,
 	debug Logger,
 ) {
@@ -22,21 +30,21 @@ func StartPinger(
 
 	for {
 		select {
-		case <- cStop:
+		case <- stop:
 			debug.Println("Pinger stopped")
 			return
 		case <- sendNextPing:
 		    debug.Println("Sending next ping")
 			go func() {
-				cOutgoingPackets <- packets.NewControlPacket(packets.PINGREQ)
+				send <- packets.NewControlPacket(packets.PINGREQ)
 			}()
 			sendNextPing = nil
 			pingExpired = time.After(pt / 2)
 		case <- pingExpired:
 			debug.Println("Pinger expired")
-			cError <- fmt.Errorf("ping resp timed out")
+			error <- fmt.Errorf("ping resp timed out")
 			return
-		case <- cPingresp:
+		case <- receive:
 			debug.Println("Pingresp received.  Resetting.")
 			sendNextPing = time.After(pt)
 			pingExpired = nil

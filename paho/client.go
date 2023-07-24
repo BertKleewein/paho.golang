@@ -40,6 +40,7 @@ type (
 		// wrapper or extend the custom net.Conn struct with sync.Locker.
 		Conn          net.Conn
 		MIDs          MIDService
+		PingHandler   Pinger
 		AuthHandler   Auther
 		Router        Router
 		Persistence   Persistence
@@ -81,10 +82,10 @@ type (
 		clientInflight *semaphore.Weighted
 		debug          Logger
 		errors         Logger
-		cIncomingPackets chan *packets.ControlPacket
-		cOutgoingPackets chan *packets.ControlPacket
-		cPingresp chan *packets.Pingresp
-		cWorkerError chan error
+		incomingPackets chan *packets.ControlPacket
+		outgoingPackets chan *packets.ControlPacket
+		pingrespPackets chan *packets.Pingresp
+		workerErrors chan error
 
 	}
 
@@ -136,10 +137,10 @@ func NewClient(conf ClientConfig) *Client {
 		ClientConfig: conf,
 		errors:       NOOPLogger{},
 		debug:        NOOPLogger{},
-		cIncomingPackets: make(chan *packets.ControlPacket),
-		cOutgoingPackets: make(chan *packets.ControlPacket),
-		cPingresp: make(chan *packets.Pingresp),
-		cWorkerError: make(chan error),
+		incomingPackets: make(chan *packets.ControlPacket),
+		outgoingPackets: make(chan *packets.ControlPacket),
+		pingrespPackets: make(chan *packets.Pingresp),
+		workerErrors: make(chan error),
 	}
 
 	if c.Persistence == nil {
@@ -153,6 +154,9 @@ func NewClient(conf ClientConfig) *Client {
 	}
 	if c.Router == nil {
 		c.Router = NewStandardRouter()
+	}
+	if c.PingHandler == nil {
+		c.PingHandler = DefaultPinger
 	}
 	if c.OnClientError == nil {
 		c.OnClientError = func(e error) {}
@@ -301,7 +305,7 @@ func (c *Client) startWorkers(keepalive uint16) {
 	go func() {
 		defer c.workers.Done()
 		defer c.debug.Println("returning from ping handler worker")
-		StartPinger(c.cPingresp, c.cOutgoingPackets, c.stop, c.cWorkerError, time.Duration(keepalive)*time.Second, c.debug)
+		c.PingHandler(c.pingrespPackets, c.outgoingPackets, c.stop, c.workerErrors, time.Duration(keepalive)*time.Second, c.debug)
 	}()
 
 	c.debug.Println("starting publish packets loop")
@@ -429,7 +433,7 @@ func (c *Client) incoming() {
 		select {
 		case <-c.stop:
 			return	
-		case recv := <- c.cIncomingPackets:
+		case recv := <- c.incomingPackets:
 			switch recv.Type {
 			case packets.CONNACK:
 				c.debug.Println("received CONNACK")
@@ -535,7 +539,7 @@ func (c *Client) incoming() {
 			case packets.PINGRESP:
 				go func() {
 					c.debug.Println("received PINGRESP")
-					c.cPingresp <- recv.Content.(*packets.Pingresp)
+					c.pingrespPackets <- recv.Content.(*packets.Pingresp)
 				}()
 			}
 		}
@@ -562,7 +566,7 @@ func (c *Client) networkLoop () {
 		case <-c.stop:
 			c.debug.Println("Loop stop")
 			return
-		case p := <- c.cOutgoingPackets:
+		case p := <- c.outgoingPackets:
 			_, err := p.WriteTo(c.Conn)
 			if err != nil {
 				c.debug.Printf("outgoing loop error: %v",err)
@@ -570,10 +574,10 @@ func (c *Client) networkLoop () {
 				return
 			}
 		case p:= <- cIncoming:
-			c.cIncomingPackets <- p
+			c.incomingPackets <- p
 			go readNext()
 
-		case e:= <- c.cWorkerError:
+		case e:= <- c.workerErrors:
 			go c.error(e)
 		}
 	}
