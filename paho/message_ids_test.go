@@ -33,8 +33,7 @@ func TestMidNoExhaustion(t *testing.T) {
 	c.clientInflight = semaphore.NewWeighted(10)
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
-	go c.incoming()
-	go c.PingHandler.Start(c.Conn, 30*time.Second)
+	c.startWorkers(30)
 
 	for i := 0; i < 70000; i++ {
 		p := &Publish{
@@ -61,7 +60,7 @@ func TestMidExhaustion(t *testing.T) {
 	c.clientInflight = semaphore.NewWeighted(10)
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
-	c.SetDebugLogger(log.New(os.Stderr, "PUBLISHQOS1: ", log.LstdFlags))
+	c.SetDebugLogger(log.New(os.Stderr, "TESTMIDEXHAUSTION: ", log.LstdFlags))
 
 	cp := &CPContext{}
 	for i := range c.MIDs.(*MIDs).index {

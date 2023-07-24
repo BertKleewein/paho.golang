@@ -40,8 +40,8 @@ type (
 		// wrapper or extend the custom net.Conn struct with sync.Locker.
 		Conn          net.Conn
 		MIDs          MIDService
-		AuthHandler   Auther
 		PingHandler   Pinger
+		AuthHandler   Auther
 		Router        Router
 		Persistence   Persistence
 		PacketTimeout time.Duration
@@ -82,6 +82,11 @@ type (
 		clientInflight *semaphore.Weighted
 		debug          Logger
 		errors         Logger
+		incomingPackets chan *packets.ControlPacket
+		outgoingPackets chan *packets.ControlPacket
+		pingrespPackets chan *packets.Pingresp
+		workerErrors chan error
+
 	}
 
 	// CommsProperties is a struct of the communication properties that may
@@ -132,6 +137,10 @@ func NewClient(conf ClientConfig) *Client {
 		ClientConfig: conf,
 		errors:       NOOPLogger{},
 		debug:        NOOPLogger{},
+		incomingPackets: make(chan *packets.ControlPacket),
+		outgoingPackets: make(chan *packets.ControlPacket),
+		pingrespPackets: make(chan *packets.Pingresp),
+		workerErrors: make(chan error),
 	}
 
 	if c.Persistence == nil {
@@ -147,9 +156,7 @@ func NewClient(conf ClientConfig) *Client {
 		c.Router = NewStandardRouter()
 	}
 	if c.PingHandler == nil {
-		c.PingHandler = DefaultPingerWithCustomFailHandler(func(e error) {
-			go c.error(e)
-		})
+		c.PingHandler = DefaultPinger
 	}
 	if c.OnClientError == nil {
 		c.OnClientError = func(e error) {}
@@ -285,12 +292,20 @@ func (c *Client) Connect(ctx context.Context, cp *Connect) (*Connack, error) {
 	c.serverInflight = semaphore.NewWeighted(int64(c.serverProps.ReceiveMaximum))
 	c.clientInflight = semaphore.NewWeighted(int64(c.clientProps.ReceiveMaximum))
 
-	c.debug.Println("received CONNACK, starting PingHandler")
+	c.debug.Println("received CONNACK, starting workers")
+	c.startWorkers(keepalive)
+	return ca, nil
+}
+
+
+func (c *Client) startWorkers(keepalive uint16) {
+
+	c.debug.Println("starting PingHandler")
 	c.workers.Add(1)
 	go func() {
 		defer c.workers.Done()
 		defer c.debug.Println("returning from ping handler worker")
-		c.PingHandler.Start(c.Conn, time.Duration(keepalive)*time.Second)
+		c.PingHandler(c.pingrespPackets, c.outgoingPackets, c.stop, c.workerErrors, time.Duration(keepalive)*time.Second, c.debug)
 	}()
 
 	c.debug.Println("starting publish packets loop")
@@ -299,6 +314,14 @@ func (c *Client) Connect(ctx context.Context, cp *Connect) (*Connack, error) {
 		defer c.workers.Done()
 		defer c.debug.Println("returning from publish packets loop worker")
 		c.routePublishPackets()
+	}()
+
+	c.debug.Println("starting network loop")
+	c.workers.Add(1)
+	go func() {
+		defer c.workers.Done()
+		defer c.debug.Println("returning from network loop")
+		c.networkLoop()
 	}()
 
 	c.debug.Println("starting incoming")
@@ -337,8 +360,6 @@ func (c *Client) Connect(ctx context.Context, cp *Connect) (*Connack, error) {
 			}
 		}()
 	}
-
-	return ca, nil
 }
 
 func (c *Client) Ack(pb *Publish) error {
@@ -411,13 +432,8 @@ func (c *Client) incoming() {
 	for {
 		select {
 		case <-c.stop:
-			return
-		default:
-			recv, err := packets.ReadPacket(c.Conn)
-			if err != nil {
-				go c.error(err)
-				return
-			}
+			return	
+		case recv := <- c.incomingPackets:
 			switch recv.Type {
 			case packets.CONNACK:
 				c.debug.Println("received CONNACK")
@@ -521,9 +537,48 @@ func (c *Client) incoming() {
 				}()
 				return
 			case packets.PINGRESP:
-				c.debug.Println("received PINGRESP")
-				c.PingHandler.PingResp()
+				go func() {
+					c.debug.Println("received PINGRESP")
+					c.pingrespPackets <- recv.Content.(*packets.Pingresp)
+				}()
 			}
+		}
+	}
+}
+
+func (c *Client) networkLoop () {
+	cIncoming := make(chan *packets.ControlPacket)
+	readNext := func() {
+		recv, err := packets.ReadPacket(c.Conn)
+		if err != nil {
+			c.debug.Printf("incoming loop error: %v",err)
+			go c.error(err)
+			return
+		} else {
+			c.debug.Println(fmt.Sprintf("Received: %v", recv.PacketType()))
+			cIncoming <- recv
+		}
+	}
+
+	go readNext()
+	for {
+		select {
+		case <-c.stop:
+			c.debug.Println("Loop stop")
+			return
+		case p := <- c.outgoingPackets:
+			_, err := p.WriteTo(c.Conn)
+			if err != nil {
+				c.debug.Printf("outgoing loop error: %v",err)
+				go c.error(err)
+				return
+			}
+		case p:= <- cIncoming:
+			c.incomingPackets <- p
+			go readNext()
+
+		case e:= <- c.workerErrors:
+			go c.error(e)
 		}
 	}
 }
@@ -543,8 +598,6 @@ func (c *Client) close() {
 	close(c.publishPackets)
 
 	c.debug.Println("client stopped")
-	c.PingHandler.Stop()
-	c.debug.Println("ping stopped")
 	_ = c.Conn.Close()
 	c.debug.Println("conn closed")
 	c.acksTracker.reset()
@@ -636,7 +689,7 @@ func (c *Client) Subscribe(ctx context.Context, s *Subscribe) (*Suback, error) {
 	if !c.serverProps.SharedSubAvailable {
 		for _, sub := range s.Subscriptions {
 			if strings.HasPrefix(sub.Topic, "$share") {
-				return nil, fmt.Errorf("cannont subscribe to %s, server does not support shared subscriptions", sub.Topic)
+				return nil, fmt.Errorf("cannot subscribe to %s, server does not support shared subscriptions", sub.Topic)
 			}
 		}
 	}
