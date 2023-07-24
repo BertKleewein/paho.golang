@@ -44,6 +44,7 @@ type (
 		AuthHandler   Auther
 		Router        Router
 		Persistence   Persistence
+		subscriber    *SubUnsubHandler
 		PacketTimeout time.Duration
 		// OnServerDisconnect is called only when a packets.DISCONNECT is received from server
 		OnServerDisconnect func(*Disconnect)
@@ -160,6 +161,9 @@ func NewClient(conf ClientConfig) *Client {
 	}
 	if c.OnClientError == nil {
 		c.OnClientError = func(e error) {}
+	}
+	if c.subscriber == nil {
+		c.subscriber = NewSubUnsubHandler()
 	}
 
 	return c
@@ -332,6 +336,14 @@ func (c *Client) startWorkers(keepalive uint16) {
 		c.incoming()
 	}()
 
+	c.debug.Println("starting subscriber")
+	c.workers.Add(1)
+	go func() {
+		defer c.workers.Done()
+		defer c.debug.Println("returning from subscriber worker")
+		c.subscriber.Run(c.outgoingPackets, c.stop, c.workerErrors)
+	}()
+
 	if c.EnableManualAcknowledgment {
 		c.debug.Println("starting acking routine")
 
@@ -470,7 +482,14 @@ func (c *Client) incoming() {
 					c.publishPackets <- pb
 					c.mu.Unlock()
 				}
-			case packets.PUBACK, packets.PUBCOMP, packets.SUBACK, packets.UNSUBACK:
+
+			case packets.UNSUBACK, packets.SUBACK:
+				go func() {
+					c.debug.Printf("received %s packet with id %d", recv.PacketType(), recv.PacketID())
+					c.subscriber.Receive <- recv
+				}()
+
+			case packets.PUBACK, packets.PUBCOMP:
 				c.debug.Printf("received %s packet with id %d", recv.PacketType(), recv.PacketID())
 				if cpCtx := c.MIDs.Get(recv.PacketID()); cpCtx != nil {
 					cpCtx.Return <- *recv
@@ -564,7 +583,7 @@ func (c *Client) networkLoop () {
 	for {
 		select {
 		case <-c.stop:
-			c.debug.Println("Loop stop")
+			c.debug.Println("Network loop stop")
 			return
 		case p := <- c.outgoingPackets:
 			_, err := p.WriteTo(c.Conn)
@@ -698,39 +717,15 @@ func (c *Client) Subscribe(ctx context.Context, s *Subscribe) (*Suback, error) {
 
 	subCtx, cf := context.WithTimeout(ctx, c.PacketTimeout)
 	defer cf()
-	cpCtx := &CPContext{subCtx, make(chan packets.ControlPacket, 1)}
 
-	sp := s.Packet()
-
-	mid, err := c.MIDs.Request(cpCtx)
+	c.debug.Println("sending SUBSCRIBE")
+	packetSuback, err := c.subscriber.Subscribe(subCtx, s.Packet())
 	if err != nil {
 		return nil, err
 	}
-	defer c.MIDs.Free(mid)
-	sp.PacketID = mid
-
-	c.debug.Println("sending SUBSCRIBE")
-	if _, err := sp.WriteTo(c.Conn); err != nil {
-		return nil, err
-	}
-	c.debug.Println("waiting for SUBACK")
-	var sap packets.ControlPacket
-
-	select {
-	case <-subCtx.Done():
-		if ctxErr := subCtx.Err(); ctxErr != nil {
-			c.debug.Println(fmt.Sprintf("terminated due to context: %v", ctxErr))
-			return nil, ctxErr
-		}
-	case sap = <-cpCtx.Return:
-	}
-
-	if sap.Type != packets.SUBACK {
-		return nil, fmt.Errorf("received %d instead of Suback", sap.Type)
-	}
 	c.debug.Println("received SUBACK")
-
-	sa := SubackFromPacketSuback(sap.Content.(*packets.Suback))
+	
+	sa := SubackFromPacketSuback(packetSuback)
 	switch {
 	case len(sa.Reasons) == 1:
 		if sa.Reasons[0] >= 0x80 {
@@ -748,7 +743,7 @@ func (c *Client) Subscribe(ctx context.Context, s *Subscribe) (*Suback, error) {
 				return sa, fmt.Errorf("at least one requested subscription failed")
 			}
 		}
-	}
+		}
 
 	return sa, nil
 }
@@ -761,39 +756,15 @@ func (c *Client) Unsubscribe(ctx context.Context, u *Unsubscribe) (*Unsuback, er
 	c.debug.Printf("unsubscribing from %+v", u.Topics)
 	unsubCtx, cf := context.WithTimeout(ctx, c.PacketTimeout)
 	defer cf()
-	cpCtx := &CPContext{unsubCtx, make(chan packets.ControlPacket, 1)}
 
-	up := u.Packet()
-
-	mid, err := c.MIDs.Request(cpCtx)
+	c.debug.Println("sending UNSUBSCRIBE")
+	packetUnsuback, err := c.subscriber.Unsubscribe(unsubCtx, u.Packet())
 	if err != nil {
 		return nil, err
 	}
-	defer c.MIDs.Free(mid)
-	up.PacketID = mid
+	c.debug.Println("received UNSUBACK")
 
-	c.debug.Println("sending UNSUBSCRIBE")
-	if _, err := up.WriteTo(c.Conn); err != nil {
-		return nil, err
-	}
-	c.debug.Println("waiting for UNSUBACK")
-	var uap packets.ControlPacket
-
-	select {
-	case <-unsubCtx.Done():
-		if ctxErr := unsubCtx.Err(); ctxErr != nil {
-			c.debug.Println(fmt.Sprintf("terminated due to context: %v", ctxErr))
-			return nil, ctxErr
-		}
-	case uap = <-cpCtx.Return:
-	}
-
-	if uap.Type != packets.UNSUBACK {
-		return nil, fmt.Errorf("received %d instead of Unsuback", uap.Type)
-	}
-	c.debug.Println("received SUBACK")
-
-	ua := UnsubackFromPacketUnsuback(uap.Content.(*packets.Unsuback))
+	ua := UnsubackFromPacketUnsuback(packetUnsuback)
 	switch {
 	case len(ua.Reasons) == 1:
 		if ua.Reasons[0] >= 0x80 {
@@ -971,6 +942,7 @@ func (c *Client) Disconnect(d *Disconnect) error {
 // and sets it to be used by the debug log endpoint
 func (c *Client) SetDebugLogger(l Logger) {
 	c.debug = l
+	c.subscriber.SetDebugLogger(l)
 }
 
 // SetErrorLogger takes an instance of the paho Logger interface

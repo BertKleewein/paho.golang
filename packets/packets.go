@@ -109,6 +109,33 @@ func (c *ControlPacket) PacketID() uint16 {
 	}
 }
 
+// SetPacketID is a helper function that sets the value of the PacketID
+// field for any kind of mqtt packet in the Content element
+func (c *ControlPacket) SetPacketID(packetID uint16) {
+	switch r := c.Content.(type) {
+	case *Publish:
+		r.PacketID = packetID
+	case *Puback:
+		r.PacketID = packetID
+	case *Pubrec:
+		r.PacketID = packetID
+	case *Pubrel:
+		r.PacketID = packetID
+	case *Pubcomp:
+		r.PacketID = packetID
+	case *Subscribe:
+		r.PacketID = packetID
+	case *Suback:
+		r.PacketID = packetID
+	case *Unsubscribe:
+		r.PacketID = packetID
+	case *Unsuback:
+		r.PacketID = packetID
+	default:
+		panic("undefined PacketType()")
+	}
+}
+
 func (c *ControlPacket) PacketType() string {
 	return [...]string{
 		"",

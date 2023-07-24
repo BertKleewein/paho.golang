@@ -58,10 +58,14 @@ func (u *Unsubscribe) Buffers() net.Buffers {
 	return net.Buffers{b.Bytes(), propLen, idvp, topics.Bytes()}
 }
 
-// WriteTo is the implementation of the interface required function for a packet
-func (u *Unsubscribe) WriteTo(w io.Writer) (int64, error) {
+// Wrap the Unsubscribe object into a ControlPacket
+func (u *Unsubscribe) ToControlPacket() *ControlPacket {
 	cp := &ControlPacket{FixedHeader: FixedHeader{Type: UNSUBSCRIBE, Flags: 2}}
 	cp.Content = u
+	return cp
+}
 
-	return cp.WriteTo(w)
+// WriteTo is the implementation of the interface required function for a packet
+func (u *Unsubscribe) WriteTo(w io.Writer) (int64, error) {
+	return u.ToControlPacket().WriteTo(w)
 }
